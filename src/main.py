@@ -6,6 +6,10 @@ from datetime import date
 
 import requests
 
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+RETRY_COUNT = 3
+RETRY_DELAY_SECONDS = 2
+
 import push
 from skyland import start
 
@@ -49,7 +53,7 @@ def config_logger():
     _get = requests.get
     _post = requests.post
 
-    def get(*args, **kwargs):
+    def _request_with_retry(method_name, request_func, *args, **kwargs):
         if use_proxy:
             kwargs.update({
                 'proxies': {
@@ -57,21 +61,32 @@ def config_logger():
                 },
                 'verify': False
             })
-        response = _get(*args, **kwargs)
-        logger.debug(f'GET {args[0]} - {response.status_code} - {filter_code(response.text)}')
-        return response
+
+        last_error = None
+        for attempt in range(1, RETRY_COUNT + 1):
+            try:
+                response = request_func(*args, **kwargs)
+                if response.status_code in RETRYABLE_STATUS_CODES:
+                    raise requests.exceptions.HTTPError(f'{method_name} returned {response.status_code}')
+                logger.debug(f'{method_name.upper()} {args[0]} - {response.status_code} - {filter_code(response.text)}')
+                return response
+            except requests.exceptions.RequestException as ex:
+                last_error = ex
+                if attempt == RETRY_COUNT:
+                    logger.warning(f'{method_name.upper()} {args[0]} failed after {RETRY_COUNT} attempts: {ex}')
+                    raise
+                logger.warning(f'{method_name.upper()} {args[0]} attempt {attempt} failed: {ex}, retrying in {RETRY_DELAY_SECONDS}s')
+                time.sleep(RETRY_DELAY_SECONDS)
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(f'{method_name.upper()} request failed without a captured error')
+
+    def get(*args, **kwargs):
+        return _request_with_retry('get', _get, *args, **kwargs)
 
     def post(*args, **kwargs):
-        if use_proxy:
-            kwargs.update({
-                'proxies': {
-                    'https': 'http://localhost:8000',
-                },
-                'verify': False
-            })
-        response = _post(*args, **kwargs)
-        logger.debug(f'POST {args[0]} - {response.status_code} - {filter_code(response.text)}')
-        return response
+        return _request_with_retry('post', _post, *args, **kwargs)
 
     # 替换 requests 中的方法
     requests.get = get
